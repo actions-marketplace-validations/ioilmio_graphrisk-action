@@ -31886,6 +31886,7 @@ async function run() {
   try {
     const apiKey = core.getInput('api-key');
     const ecosystem = core.getInput('ecosystem');
+    const timeoutSeconds = parseInt(core.getInput('timeout') || '600', 10);
     const apiUrl = process.env.GRAPHRISK_API_URL || 'https://graphrisk.io/api'; // Make configurable
 
     // 1. Context & Identity
@@ -31895,36 +31896,60 @@ async function run() {
     console.log(`Starting scan for ${repositoryUrl} (${ecosystem})...`);
 
     // 2. Read Manifest
-    // TODO: Support various manifest files based on ecosystem
-    const manifestFile = 'package.json'; // Fixed for now
+    const ecosystemManifests = {
+      'npm': 'package.json',
+      'pip': 'requirements.txt',
+      'pypi': 'requirements.txt',
+      'poetry': 'pyproject.toml',
+      'pipenv': 'Pipfile',
+      'go': 'go.mod',
+      'rubygems': 'Gemfile',
+      'bundler': 'Gemfile'
+    };
+
+    const manifestFile = ecosystemManifests[ecosystem.toLowerCase()];
+    if (!manifestFile) {
+      core.setFailed(`Unsupported ecosystem '${ecosystem}'. Supported: npm, pip, pypi, poetry, pipenv, go, rubygems, bundler`);
+      return;
+    }
     if (!fs.existsSync(manifestFile)) {
-      core.setFailed(`Manifest file ${manifestFile} not found.`);
+      core.setFailed(`Manifest file ${manifestFile} not found for ecosystem '${ecosystem}'.`);
       return;
     }
     const manifestContent = fs.readFileSync(manifestFile, 'utf8');
 
     // 3. Initiate Scan
     console.log('Initiating async scan...');
-    const initResponse = await request('POST', `${apiUrl}/scan/async`, {
+    const projectId = core.getInput('project-id');
+    const scanPayload = {
       repositoryUrl,
       manifestContent,
       ecosystem
-    }, {
+    };
+    if (projectId) {
+      scanPayload.projectId = projectId;
+    }
+    const initResponse = await request('POST', `${apiUrl}/scan/async`, scanPayload, {
       'x-api-key': apiKey
     });
 
     const scanId = initResponse.scanId;
-    const projectId = initResponse.project?.id;
-    console.log(`Scan initiated. ID: ${scanId}. Project ID: ${projectId}`);
+    const responseProjectId = initResponse.project?.id;
+    console.log(`Scan initiated. ID: ${scanId}. Project ID: ${responseProjectId}`);
     console.log('Use this Scan ID to check status via API.');
 
     // 4. Poll for Completion
     let status = 'PENDING';
     let attempts = 0;
-    const maxAttempts = 60; // 10 minutes (10s interval)
+    const pollInterval = 10; // seconds
+    const maxAttempts = Math.ceil(timeoutSeconds / pollInterval);
+    let errorCount = 0;
+    const maxErrors = 5;
 
-    while (status === 'PENDING' && attempts < maxAttempts) {
-      await sleep(10000);
+    console.log(`Polling for scan completion (max ${timeoutSeconds}s timeout, ${maxAttempts} attempts)...`);
+
+    while (status === 'PENDING' && attempts < maxAttempts && errorCount < maxErrors) {
+      await sleep(pollInterval * 1000);
       attempts++;
 
       try {
@@ -31932,12 +31957,47 @@ async function run() {
           'x-api-key': apiKey
         });
         status = statusRes.status;
-        process.stdout.write('.');
+
+        // Log progress with detailed information
+        const vulnCount = statusRes.vulnerabilityCount || 0;
+        const currentStep = statusRes.currentStep;
+        const progress = statusRes.progress || 0;
+        const totalDeps = statusRes.totalDependencies || 0;
+        const elapsed = attempts * pollInterval;
+
+        // Build status message
+        let statusMsg = `[${elapsed}s elapsed]`;
+        if (currentStep && currentStep !== 'unknown') {
+          statusMsg += ` Step: ${currentStep.replace(/_/g, ' ')}`;
+        }
+        if (progress > 0) {
+          statusMsg += ` (${progress}%)`;
+        }
+        if (totalDeps > 0) {
+          statusMsg += ` - ${totalDeps} dependencies`;
+        }
+        if (vulnCount > 0) {
+          statusMsg += ` - ${vulnCount} vulnerabilities found`;
+        }
+
+        // Log every 3 attempts (30 seconds) or when we have interesting data
+        if (attempts % 3 === 0 || vulnCount > 0 || (currentStep && currentStep !== 'parsing_manifest')) {
+          const remaining = (maxAttempts - attempts) * 10;
+          console.log(`${statusMsg} - ${remaining}s remaining`);
+        } else {
+          process.stdout.write('.');
+        }
       } catch (e) {
-        console.error('Polling error:', e.message);
+        errorCount++;
+        console.error(`Polling error (${errorCount}/${maxErrors}):`, e.message);
       }
     }
-    console.log('\n');
+    console.log('');
+
+    if (errorCount >= maxErrors) {
+      core.setFailed(`Too many polling errors (${errorCount}). Last status: ${status}`);
+      return;
+    }
 
     if (status !== 'COMPLETED') {
       core.setFailed(`Scan timed out or failed. Status: ${status}`);
@@ -31956,12 +32016,24 @@ async function run() {
     console.log('SARIF report saved to graphrisk.sarif');
 
     // 6. Summary Logic (Fail on Severity?)
-    const criticalCount = sarif.runs[0].results.filter(r => r.level === 'error').length;
+    const results = sarif?.runs?.[0]?.results || [];
+    const criticalCount = results.filter(r => r.level === 'error').length;
+    const warningCount = results.filter(r => r.level === 'warning').length;
+    const noteCount = results.filter(r => r.level === 'note').length;
+    
+    console.log(`\n=== Scan Summary ===`);
+    console.log(`Total issues: ${results.length}`);
+    console.log(`  Critical (error): ${criticalCount}`);
+    console.log(`  Warnings: ${warningCount}`);
+    console.log(`  Notes: ${noteCount}`);
+    
     if (criticalCount > 0) {
       core.warning(`Found ${criticalCount} critical vulnerabilities.`);
       // core.setFailed('Critical vulnerabilities found.'); // Optional: Fail build
+    } else if (results.length === 0) {
+      console.log('✅ No vulnerabilities found.');
     } else {
-      console.log('No critical vulnerabilities found.');
+      console.log(`Found ${results.length} non-critical issues.`);
     }
 
   } catch (error) {
